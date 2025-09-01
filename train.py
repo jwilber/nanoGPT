@@ -1,6 +1,12 @@
 # train.py
+import os
 import os, time, math, pickle
 from contextlib import nullcontext
+import datetime
+import wandb
+
+import torch.distributed as dist
+
 
 import numpy as np
 import torch
@@ -11,18 +17,37 @@ import hydra
 from omegaconf import DictConfig, OmegaConf
 from hydra.utils import to_absolute_path
 
-def _resolve_dtype(cfg_dtype: str) -> str:
-    if cfg_dtype != "auto":
-        return cfg_dtype
-    if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
-        return "bfloat16"
-    return "float16"
+import process_group_manager as pgm
+from process_group_manager import setup_process_group_manager
+
+os.environ["DEVICE"] = "cuda"
+local_rank = int(os.environ["LOCAL_RANK"])
+global_rank = int(os.environ["RANK"])
+world_size = int(os.environ["WORLD_SIZE"])
+backend = "nccl"
+
+dist.init_process_group(rank=global_rank, world_size=world_size, backend=backend, init_method=f"env://", timeout=datetime.timedelta(minutes=2))
+
 
 @hydra.main(config_path="conf", config_name="config", version_base=None)
 def main(cfg: DictConfig):
     # ----- config normalization -----
-    dtype = _resolve_dtype(cfg.dtype)
+    dtype = torch.bfloat16
     config = OmegaConf.to_container(cfg, resolve=True)  # for logging/checkpoint parity
+    torch.cuda.set_device(local_rank)
+    device = torch.device("cuda", local_rank)
+    device_type = 'cuda'
+
+
+    print(f"local rank {local_rank}")
+    if local_rank == 0: print(f"cfg {cfg}")
+
+    # dist stuff
+    setup_process_group_manager(dp_size=cfg.dp_size, pp_size=cfg.pp_size, tp_size=cfg.tp_size)
+
+    is_wandb_rank = pgm.process_group_manager.tp_rank == 0 and pgm.process_group_manager.dp_rank == 0 and pgm.process_group_manager.pp_is_last_stage
+    # set seed
+    
 
     tokens_per_iter = cfg.gradient_accumulation_steps * cfg.batch_size * cfg.block_size
     print(f"tokens per iteration will be: {tokens_per_iter:,}")
@@ -31,10 +56,8 @@ def main(cfg: DictConfig):
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
 
-    device = cfg.device
-    device_type = 'cuda' if 'cuda' in device else 'cpu'
-    ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[dtype]
-    ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
+    ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=dtype)
+
 
     # data dir: keep relative to project root
     data_dir = os.path.join(to_absolute_path('data'), cfg.dataset)
@@ -83,9 +106,9 @@ def main(cfg: DictConfig):
     model.to(device)
 
     scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
-
+    dist.barrier()
     optimizer = model.configure_optimizers(cfg.weight_decay, cfg.learning_rate, (cfg.beta1, cfg.beta2), device_type)
-    checkpoint = None
+    dist.barrier()
 
     @torch.no_grad()
     def estimate_loss():
@@ -115,8 +138,19 @@ def main(cfg: DictConfig):
         return cfg.min_lr + coeff * (cfg.learning_rate - cfg.min_lr)
 
     if cfg.wandb_log:
-        import wandb
-        wandb.init(project=cfg.wandb_project, name=cfg.wandb_run_name, config=config)
+        if is_wandb_rank:
+            wandb.init(
+                project="nanogpt_dist",
+                name=f"{cfg.wandb_run_name}_{pgm.process_group_manager}",
+                config={
+                    "tensor_parallel_size": pgm.process_group_manager.tp_world_size,
+                    "pipeline_parallel_size": pgm.process_group_manager.pp_world_size,
+                    "data_parallel_size": pgm.process_group_manager.dp_world_size,
+                    "model": cfg.model_name,
+                    "learning_rate": cfg.learning_rate,
+                    "seed": cfg.seed,
+                },
+            )
 
     X, Y = get_batch('train')
     t0 = time.time()
@@ -142,19 +176,6 @@ def main(cfg: DictConfig):
                     "val/loss": losses['val'],
                     "lr": lr,
                 })
-            if losses['val'] < best_val_loss or cfg.always_save_checkpoint:
-                best_val_loss = losses['val']
-                if iter_num > 0:
-                    checkpoint = {
-                        'model': raw_model.state_dict(),
-                        'optimizer': optimizer.state_dict(),
-                        'model_args': model_args,
-                        'iter_num': iter_num,
-                        'best_val_loss': best_val_loss,
-                        'config': config,
-                    }
-                    print(f"saving checkpoint to {out_dir_abs}")
-                    torch.save(checkpoint, os.path.join(out_dir_abs, 'ckpt.pt'))
         if iter_num == 0 and cfg.eval_only:
             break
 
