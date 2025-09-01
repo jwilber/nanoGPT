@@ -122,7 +122,6 @@ def main(cfg: DictConfig):
     t0 = time.time()
     local_iter_num = 0
     raw_model = model
-    running_mfu = -1.0
 
     # ensure out_dir exists (relative to project root)
     out_dir_abs = to_absolute_path(cfg.out_dir)
@@ -142,7 +141,6 @@ def main(cfg: DictConfig):
                     "train/loss": losses['train'],
                     "val/loss": losses['val'],
                     "lr": lr,
-                    "mfu": running_mfu*100,
                 })
             if losses['val'] < best_val_loss or cfg.always_save_checkpoint:
                 best_val_loss = losses['val']
@@ -178,10 +176,7 @@ def main(cfg: DictConfig):
         t0 = t1
         if iter_num % cfg.log_interval == 0:
             lossf = loss.item() * cfg.gradient_accumulation_steps
-            if local_iter_num >= 5:
-                mfu = raw_model.estimate_mfu(cfg.batch_size * cfg.gradient_accumulation_steps, dt)
-                running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
-            print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
+            print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms")
         iter_num += 1
         local_iter_num += 1
 
